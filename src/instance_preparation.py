@@ -11,8 +11,8 @@ from tqdm import tqdm
 INSTANCE_FOLDER = "../tsp_instances"
 SOLUTION_FOLDER = "../tsp_solutions"
 NUM_INSTANCES = 500
-MIN_NODES = 100
-MAX_NODES = 500
+MIN_NODES = 50
+MAX_NODES = 50
 
 # Create directories
 os.makedirs(INSTANCE_FOLDER, exist_ok=True)
