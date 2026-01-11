@@ -11,7 +11,7 @@ import wandb
 
 # --- Configuration ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NUM_EPOCHS = 20
+NUM_EPOCHS = 200
 BATCH_SIZE = 64
 TRAIN_BATCHES = 100
 LEARNING_RATE = 1e-4
@@ -22,7 +22,7 @@ SOLUTION_PATH = "../tsp_solutions"
 
 # W&B settings
 WANDB_PROJECT = "tsp-attention-rl"
-WANDB_RUN_NAME = None  # e.g. "tsp50-baseline-v1"
+WANDB_RUN_NAME =  "tsp50-baseline-v7" # e.g. "tsp50-baseline-v1"
 
 
 def load_validation_data():
@@ -55,7 +55,7 @@ def load_validation_data():
                     if "COST" in line:
                         cost = float(line.split(":")[-1].strip())
         val_solutions.append(cost)
-
+        # print(val_nodes, val_solutions)
     return torch.tensor(val_nodes, dtype=torch.float32).to(DEVICE), val_solutions
 
 
@@ -75,6 +75,7 @@ def rollout(model, dataset, greedy=False):
     visited[:, 0] = 1
 
     tour_log_probs = []
+    tour_entropies = []
     tour_lengths = torch.zeros(batch_size).to(DEVICE)
 
     start_nodes = dataset[:, 0, :]
@@ -89,6 +90,7 @@ def rollout(model, dataset, greedy=False):
             dist = torch.distributions.Categorical(probs)
             action = dist.sample()
             tour_log_probs.append(dist.log_prob(action))
+            tour_entropies.append(dist.entropy())
 
         visited.scatter_(1, action.unsqueeze(1), 1)
         curr_node = action.unsqueeze(1)
@@ -102,7 +104,7 @@ def rollout(model, dataset, greedy=False):
 
     if greedy:
         return tour_lengths
-    return tour_lengths, torch.stack(tour_log_probs, dim=1).sum(dim=1)
+    return tour_lengths, torch.stack(tour_log_probs, dim=1).sum(dim=1), torch.stack(tour_entropies, dim=1).sum(dim=1)
 
 
 def grad_norm_l2(model: torch.nn.Module) -> float:
@@ -138,10 +140,28 @@ def train():
     # -----------------------
     policy = AttentionModel(embedding_dim=EMBEDDING_DIM).to(DEVICE)
     baseline = AttentionModel(embedding_dim=EMBEDDING_DIM).to(DEVICE)
-    baseline.load_state_dict(policy.state_dict())
+
+    ckpt_path = "best_tsp_model.pth"
+
+    if os.path.exists(ckpt_path):
+        print(f"Resuming training from {ckpt_path}")
+        policy.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
+        baseline.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
+    else:
+        print("No checkpoint found. Initializing baseline from policy.")
+        baseline.load_state_dict(policy.state_dict())
+
     baseline.eval()
 
     optimizer = optim.Adam(policy.parameters(), lr=LEARNING_RATE)
+
+    total_steps = NUM_EPOCHS * TRAIN_BATCHES
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps,     # steps, not epochs
+        eta_min=LEARNING_RATE * 0.05,  # final LR (e.g., 5% of initial)
+    )
 
     # Optional: track params/gradients (can be a bit heavy)
     wandb.watch(policy, log="gradients", log_freq=200)
@@ -172,17 +192,30 @@ def train():
 
             data = torch.rand(BATCH_SIZE, NUM_NODES, 2).to(DEVICE) * 1000
 
-            cost, log_probs = rollout(policy, data, greedy=False)
+            # data = normalize_xy(data)
+
+            cost, log_probs, ent = rollout(policy, data, greedy=False)
 
             with torch.no_grad():
-                baseline_cost = rollout(baseline, data, greedy=True)
+                baseline_cost, _, _ = rollout(baseline, data, greedy=False)
+
+            entropy_coef = max(0.01 * (1 - 3*global_step / (NUM_EPOCHS * TRAIN_BATCHES)), 0.01)
 
             advantage = cost - baseline_cost
-            loss = (advantage * log_probs).mean()
+            loss = (advantage * log_probs).mean() - entropy_coef * ent.mean()
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
             optimizer.step()
+            scheduler.step()
+
+            BASELINE_EMA = 0.99  # try 0.99 or 0.995
+
+            with torch.no_grad():
+                for bp, pp in zip(baseline.parameters(), policy.parameters()):
+                    bp.data.mul_(BASELINE_EMA).add_(pp.data, alpha=1 - BASELINE_EMA)
+
 
             # stats
             loss_item = float(loss.item())
@@ -211,6 +244,8 @@ def train():
                     "train/grad_norm": gnorm,
                     "train/lr": lr,
                     "epoch": epoch + 1,
+                    "train/entropy_coef": entropy_coef,
+                    "train/entropy_mean": float(ent.mean().item())
                 },
                 step=global_step,
             )
@@ -224,6 +259,7 @@ def train():
         policy.eval()
         with torch.no_grad():
             val_batch = val_data[:, :NUM_NODES, :]
+            # val_batch = normalize_xy(val_batch)
             rl_costs = rollout(policy, val_batch, greedy=True)
             val_cost_mean = float(rl_costs.mean().item())
 
@@ -264,11 +300,11 @@ def train():
         # -----------------------
         # Baseline update + saving best model
         # -----------------------
-        upgraded = False
-        if val_cost_mean < baseline_val_mean:
-            print("  >> UPGRADE: Policy beat Baseline. Updating Baseline Network.")
-            baseline.load_state_dict(policy.state_dict())
-            upgraded = True
+        # upgraded = False
+        # if val_cost_mean < baseline_val_mean:
+        #     print("  >> UPGRADE: Policy beat Baseline. Updating Baseline Network.")
+        #     baseline.load_state_dict(policy.state_dict())
+        #     upgraded = True
 
         # Save best by validation cost (common)
         if val_cost_mean < best_val_cost:
@@ -284,7 +320,7 @@ def train():
 
         wandb.log(
             {
-                "baseline/upgraded": int(upgraded),
+                # "baseline/upgraded": int(upgraded),
                 "best/val_cost": best_val_cost,
                 "best/val_gap_percent": best_val_gap,
             },
