@@ -193,7 +193,7 @@ def create_comparison_video():
 
     # Save
     writer = animation.FFMpegWriter(fps=10, metadata=dict(artist='Me'), bitrate=1800)
-    save_path = "tsp_comparison.mp4"
+    save_path = "../output/tsp_comparison.mp4"
     ani.save(save_path, writer=writer)
     
     print(f"Video saved successfully to: {save_path}")

@@ -1,13 +1,12 @@
 import os
 import time
+import argparse
 import torch
 import torch.optim as optim
 import numpy as np
 from tqdm import tqdm
 from model import AttentionModel
-from tsp_env import TSPEnv  # (unused here but keeping as you had it)
-
-import wandb
+from tsp_env import TSPEnv 
 
 # --- Configuration ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -20,15 +19,26 @@ NUM_NODES = 50
 VALIDATION_PATH = "../tsp_instances"
 SOLUTION_PATH = "../tsp_solutions"
 
-# W&B settings
+# W&B settings (Default, can be overridden by args)
 WANDB_PROJECT = "tsp-attention-rl"
-WANDB_RUN_NAME =  "tsp50-baseline-v7" # e.g. "tsp50-baseline-v1"
+WANDB_RUN_NAME = "tsp50-baseline-v7"
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train TSP RL Agent")
+    # Boolean flag for wandb
+    parser.add_argument('--wandb', action='store_true', help='Enable W&B logging')
+    parser.add_argument('--no-wandb', dest='wandb', action='store_false', help='Disable W&B logging')
+    parser.set_defaults(wandb=True) # Default is True
+    return parser.parse_args()
 
 def load_validation_data():
-    """Loads the fixed validation set (the 500 instances you created)."""
+    """Loads the fixed validation set."""
     val_nodes = []
     val_solutions = []
+
+    if not os.path.exists(VALIDATION_PATH):
+        print(f"Error: Validation path '{VALIDATION_PATH}' not found.")
+        return torch.tensor([], device=DEVICE), []
 
     files = sorted([f for f in os.listdir(VALIDATION_PATH) if f.endswith(".txt")])[:50]
     print(f"Loading {len(files)} validation instances...")
@@ -42,8 +52,9 @@ def load_validation_data():
                     c_section = True
                     continue
                 if c_section and "EOF" not in line:
-                    _, x, y = line.split()
-                    nodes.append([float(x), float(y)])
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        nodes.append([float(parts[1]), float(parts[2])])
         val_nodes.append(nodes)
 
         sol_name = f.replace(".txt", "_sol.txt")
@@ -55,35 +66,27 @@ def load_validation_data():
                     if "COST" in line:
                         cost = float(line.split(":")[-1].strip())
         val_solutions.append(cost)
-        # print(val_nodes, val_solutions)
+        
+    if len(val_nodes) == 0:
+        return torch.tensor([], device=DEVICE), []
+        
     return torch.tensor(val_nodes, dtype=torch.float32).to(DEVICE), val_solutions
 
 
 def rollout(model, dataset, greedy=False):
-    """
-    Runs the model on a batch of graphs (dataset).
-    Returns:
-      - greedy=True: tour_lengths
-      - greedy=False: (tour_lengths, summed_log_prob)
-    """
     model.eval() if greedy else model.train()
-
     batch_size, num_nodes, _ = dataset.size()
-
     curr_node = torch.zeros(batch_size, 1, dtype=torch.long).to(DEVICE)
     visited = torch.zeros(batch_size, num_nodes).to(DEVICE)
     visited[:, 0] = 1
-
     tour_log_probs = []
     tour_entropies = []
     tour_lengths = torch.zeros(batch_size).to(DEVICE)
-
     start_nodes = dataset[:, 0, :]
     prev_nodes = dataset[:, 0, :]
 
     for _step in range(num_nodes - 1):
         probs, _log_probs = model(dataset, curr_node, visited)
-
         if greedy:
             action = probs.argmax(dim=1)
         else:
@@ -91,21 +94,17 @@ def rollout(model, dataset, greedy=False):
             action = dist.sample()
             tour_log_probs.append(dist.log_prob(action))
             tour_entropies.append(dist.entropy())
-
         visited.scatter_(1, action.unsqueeze(1), 1)
         curr_node = action.unsqueeze(1)
-
         curr_coords = dataset[torch.arange(batch_size), action]
         dist_step = torch.norm(curr_coords - prev_nodes, dim=1)
         tour_lengths += dist_step
         prev_nodes = curr_coords
 
     tour_lengths += torch.norm(start_nodes - prev_nodes, dim=1)
-
     if greedy:
         return tour_lengths
     return tour_lengths, torch.stack(tour_log_probs, dim=1).sum(dim=1), torch.stack(tour_entropies, dim=1).sum(dim=1)
-
 
 def grad_norm_l2(model: torch.nn.Module) -> float:
     total = 0.0
@@ -118,89 +117,77 @@ def grad_norm_l2(model: torch.nn.Module) -> float:
 
 
 def train():
-    # -----------------------
-    # 0) W&B init
-    # -----------------------
-    run = wandb.init(
-        project=WANDB_PROJECT,
-        name=WANDB_RUN_NAME,
-        config={
-            "num_epochs": NUM_EPOCHS,
-            "batch_size": BATCH_SIZE,
-            "train_batches_per_epoch": TRAIN_BATCHES,
-            "learning_rate": LEARNING_RATE,
-            "embedding_dim": EMBEDDING_DIM,
-            "num_nodes": NUM_NODES,
-            "device": str(DEVICE),
-        },
-    )
+    # 1. Parse Args
+    args = parse_args()
+    use_wandb = args.wandb
 
-    # -----------------------
-    # 1) Initialize Models
-    # -----------------------
+    # Safe Import
+    if use_wandb:
+        try:
+            import wandb
+            wandb.init(
+                project=WANDB_PROJECT,
+                name=WANDB_RUN_NAME,
+                config={
+                    "num_epochs": NUM_EPOCHS,
+                    "batch_size": BATCH_SIZE,
+                    "learning_rate": LEARNING_RATE,
+                    "num_nodes": NUM_NODES,
+                    "device": str(DEVICE),
+                },
+            )
+            print(f"--> WandB logging enabled. Run: {WANDB_RUN_NAME}")
+        except ImportError:
+            print("Warning: 'wandb' library not found. Disabling W&B logging.")
+            use_wandb = False
+    else:
+        print("--> WandB logging DISABLED.")
+
+    # 2. Init Model
     policy = AttentionModel(embedding_dim=EMBEDDING_DIM).to(DEVICE)
     baseline = AttentionModel(embedding_dim=EMBEDDING_DIM).to(DEVICE)
-
+    
     ckpt_path = "best_tsp_model.pth"
-
     if os.path.exists(ckpt_path):
         print(f"Resuming training from {ckpt_path}")
-        policy.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
-        baseline.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
+        state = torch.load(ckpt_path, map_location=DEVICE)
+        policy.load_state_dict(state)
+        baseline.load_state_dict(state)
     else:
         print("No checkpoint found. Initializing baseline from policy.")
         baseline.load_state_dict(policy.state_dict())
-
     baseline.eval()
 
     optimizer = optim.Adam(policy.parameters(), lr=LEARNING_RATE)
-
     total_steps = NUM_EPOCHS * TRAIN_BATCHES
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=LEARNING_RATE * 0.05)
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=total_steps,     # steps, not epochs
-        eta_min=LEARNING_RATE * 0.05,  # final LR (e.g., 5% of initial)
-    )
+    if use_wandb:
+        wandb.watch(policy, log="gradients", log_freq=200)
 
-    # Optional: track params/gradients (can be a bit heavy)
-    wandb.watch(policy, log="gradients", log_freq=200)
-
-    # -----------------------
-    # 2) Load Validation Data
-    # -----------------------
+    # 3. Load Data
     val_data, val_optimal_costs = load_validation_data()
 
     print(f"--- Starting Training on {DEVICE} ---")
-
     global_step = 0
     best_val_cost = float("inf")
-    best_val_gap = float("inf")
 
     for epoch in range(NUM_EPOCHS):
         policy.train()
         epoch_loss_sum = 0.0
-        epoch_cost_sum = 0.0
-        epoch_baseline_cost_sum = 0.0
-        epoch_adv_sum = 0.0
-
+        
         t0 = time.time()
         iterator = tqdm(range(TRAIN_BATCHES), desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
 
         for _ in iterator:
             global_step += 1
-
             data = torch.rand(BATCH_SIZE, NUM_NODES, 2).to(DEVICE) * 1000
-
-            # data = normalize_xy(data)
-
+            
             cost, log_probs, ent = rollout(policy, data, greedy=False)
-
             with torch.no_grad():
                 baseline_cost, _, _ = rollout(baseline, data, greedy=False)
 
-            entropy_coef = max(0.01 * (1 - 3*global_step / (NUM_EPOCHS * TRAIN_BATCHES)), 0.01)
-
+            entropy_coef = max(0.01 * (1 - 3*global_step / total_steps), 0.01)
             advantage = cost - baseline_cost
             loss = (advantage * log_probs).mean() - entropy_coef * ent.mean()
 
@@ -210,125 +197,46 @@ def train():
             optimizer.step()
             scheduler.step()
 
-            BASELINE_EMA = 0.99  # try 0.99 or 0.995
-
+            # Baseline EMA
             with torch.no_grad():
                 for bp, pp in zip(baseline.parameters(), policy.parameters()):
-                    bp.data.mul_(BASELINE_EMA).add_(pp.data, alpha=1 - BASELINE_EMA)
+                    bp.data.mul_(0.99).add_(pp.data, alpha=0.01)
 
+            loss_val = loss.item()
+            cost_val = cost.mean().item()
+            epoch_loss_sum += loss_val
+            iterator.set_postfix(loss=loss_val, cost=cost_val)
 
-            # stats
-            loss_item = float(loss.item())
-            cost_mean = float(cost.mean().item())
-            baseline_cost_mean = float(baseline_cost.mean().item())
-            adv_mean = float(advantage.mean().item())
-            gnorm = grad_norm_l2(policy)
-            lr = optimizer.param_groups[0]["lr"]
+            if use_wandb:
+                wandb.log({
+                    "train/loss": loss_val,
+                    "train/cost": cost_val,
+                    "train/advantage": advantage.mean().item(),
+                    "train/lr": optimizer.param_groups[0]["lr"],
+                    "train/entropy": ent.mean().item()
+                }, step=global_step)
 
-            epoch_loss_sum += loss_item
-            epoch_cost_sum += cost_mean
-            epoch_baseline_cost_sum += baseline_cost_mean
-            epoch_adv_sum += adv_mean
-
-            iterator.set_postfix(loss=loss_item, cost=cost_mean)
-
-            # -----------------------
-            # W&B: per-step logging
-            # -----------------------
-            wandb.log(
-                {
-                    "train/loss": loss_item,
-                    "train/cost": cost_mean,
-                    "train/baseline_cost": baseline_cost_mean,
-                    "train/advantage": adv_mean,
-                    "train/grad_norm": gnorm,
-                    "train/lr": lr,
-                    "epoch": epoch + 1,
-                    "train/entropy_coef": entropy_coef,
-                    "train/entropy_mean": float(ent.mean().item())
-                },
-                step=global_step,
-            )
-
-        epoch_time = time.time() - t0
-
-        # -----------------------
         # Validation
-        # -----------------------
-        print("\nValidating...")
         policy.eval()
-        with torch.no_grad():
-            val_batch = val_data[:, :NUM_NODES, :]
-            # val_batch = normalize_xy(val_batch)
-            rl_costs = rollout(policy, val_batch, greedy=True)
-            val_cost_mean = float(rl_costs.mean().item())
+        val_cost_mean = 0.0
+        if len(val_data) > 0:
+            with torch.no_grad():
+                val_batch = val_data[:, :NUM_NODES, :]
+                rl_costs = rollout(policy, val_batch, greedy=True)
+                val_cost_mean = rl_costs.mean().item()
 
-            gaps = []
-            for i, c in enumerate(rl_costs):
-                opt = val_optimal_costs[i]
-                if opt > 0:
-                    gaps.append(((float(c.item()) - opt) / opt) * 100.0)
-            val_gap_mean = float(np.mean(gaps)) if len(gaps) > 0 else float("nan")
+        print(f"Epoch {epoch+1} Val Cost: {val_cost_mean:.2f}")
 
-            baseline_val_costs = rollout(baseline, val_batch, greedy=True)
-            baseline_val_mean = float(baseline_val_costs.mean().item())
+        if use_wandb:
+            wandb.log({"val/cost": val_cost_mean, "epoch": epoch+1}, step=global_step)
 
-        print(f"Epoch {epoch+1} Results:")
-        print(f"  Train Avg Loss: {epoch_loss_sum / TRAIN_BATCHES:.4f}")
-        print(f"  Val Avg Cost: {val_cost_mean:.2f}")
-        print(f"  Val Optimality Gap (%): {val_gap_mean:.2f}")
-        print(f"  Baseline Val Avg Cost: {baseline_val_mean:.2f}")
-
-        # -----------------------
-        # W&B: per-epoch logging
-        # -----------------------
-        wandb.log(
-            {
-                "epoch_metrics/train_loss_avg": epoch_loss_sum / TRAIN_BATCHES,
-                "epoch_metrics/train_cost_avg": epoch_cost_sum / TRAIN_BATCHES,
-                "epoch_metrics/train_baseline_cost_avg": epoch_baseline_cost_sum / TRAIN_BATCHES,
-                "epoch_metrics/train_advantage_avg": epoch_adv_sum / TRAIN_BATCHES,
-                "val/cost": val_cost_mean,
-                "val/gap_percent": val_gap_mean,
-                "val/baseline_cost": baseline_val_mean,
-                "time/epoch_sec": epoch_time,
-                "epoch": epoch + 1,
-            },
-            step=global_step,
-        )
-
-        # -----------------------
-        # Baseline update + saving best model
-        # -----------------------
-        # upgraded = False
-        # if val_cost_mean < baseline_val_mean:
-        #     print("  >> UPGRADE: Policy beat Baseline. Updating Baseline Network.")
-        #     baseline.load_state_dict(policy.state_dict())
-        #     upgraded = True
-
-        # Save best by validation cost (common)
-        if val_cost_mean < best_val_cost:
+        if val_cost_mean < best_val_cost and len(val_data) > 0:
             best_val_cost = val_cost_mean
             torch.save(policy.state_dict(), "best_tsp_model.pth")
-            # log checkpoint to W&B
-            wandb.save("best_tsp_model.pth")
-            print("  >> SAVED: New best_tsp_model.pth (by val cost).")
+            print("  >> SAVED: New best_tsp_model.pth")
 
-        # Track "best gap" too (optional)
-        if np.isfinite(val_gap_mean) and val_gap_mean < best_val_gap:
-            best_val_gap = val_gap_mean
-
-        wandb.log(
-            {
-                # "baseline/upgraded": int(upgraded),
-                "best/val_cost": best_val_cost,
-                "best/val_gap_percent": best_val_gap,
-            },
-            step=global_step,
-        )
-
-    wandb.finish()
-
+    if use_wandb:
+        wandb.finish()
 
 if __name__ == "__main__":
     train()
