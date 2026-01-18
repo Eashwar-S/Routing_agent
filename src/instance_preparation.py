@@ -1,91 +1,80 @@
 import os
 import random
 import math
-import matplotlib.pyplot as plt
+import argparse
 import networkx as nx
+import matplotlib.pyplot as plt
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
 
 # --- Configuration ---
-INSTANCE_FOLDER = "../tsp_instances"
-SOLUTION_FOLDER = "../tsp_solutions"
-NUM_INSTANCES = 500
-MIN_NODES = 50
-MAX_NODES = 50
+TRAIN_PATH = "../data/train"
+VAL_PATH = "../data/val"
 
-# Create directories
-os.makedirs(INSTANCE_FOLDER, exist_ok=True)
-os.makedirs(SOLUTION_FOLDER, exist_ok=True)
+MIN_NODES = 20
+MAX_NODES = 100 
 
-def generate_tsp_instance(num_nodes, instance_id):
-    """Generates random 2D coordinates and saves in TSPLIB format."""
-    name = f"tsp_{instance_id}"
-    filename = os.path.join(INSTANCE_FOLDER, f"{name}.txt")
+NUM_TRAIN = 10000 
+NUM_VAL = 500      
+
+def ensure_dirs():
+    os.makedirs(os.path.join(TRAIN_PATH, "instances"), exist_ok=True)
+    os.makedirs(os.path.join(TRAIN_PATH, "solutions"), exist_ok=True)
+    os.makedirs(os.path.join(VAL_PATH, "instances"), exist_ok=True)
+    os.makedirs(os.path.join(VAL_PATH, "solutions"), exist_ok=True)
+
+def generate_and_solve(args):
+    """
+    Worker function to generate one instance and solve it.
+    Args packed in tuple for map: (idx, base_path, min_n, max_n)
+    """
+    idx, base_path, min_n, max_n = args
+    
+    # 1. Randomize Size
+    # Each process needs its own random seed state, but standard random is thread-safe enough here
+    curr_nodes = random.randint(min_n, max_n)
+    
+    # 2. Generate Instance
+    name = f"tsp_{curr_nodes}_{idx}"
+    filename = os.path.join(base_path, "instances", f"{name}.txt")
     
     nodes = []
-    # 1000x1000 grid
-    for i in range(1, num_nodes + 1):
+    for i in range(1, curr_nodes + 1):
         x = random.randint(0, 1000)
         y = random.randint(0, 1000)
         nodes.append((i, x, y))
 
     with open(filename, "w") as f:
         f.write(f"NAME: {name}\n")
-        f.write(f"COMMENT: Random TSP instance\n")
         f.write(f"TYPE: TSP\n")
-        f.write(f"DIMENSION: {num_nodes}\n")
-        f.write(f"EDGE_WEIGHT_TYPE: EUC_2D\n")
+        f.write(f"DIMENSION: {curr_nodes}\n")
         f.write("NODE_COORD_SECTION\n")
         for node_id, x, y in nodes:
             f.write(f"{node_id} {x} {y}\n")
             
-    return filename
-
-def parse_tsp_instance(filepath):
-    """Parses a TSPLIB formatted file."""
-    nodes = {}
-    with open(filepath, 'r') as f:
-        lines = f.readlines()
-        
-    coord_section = False
-    for line in lines:
-        if "NODE_COORD_SECTION" in line:
-            coord_section = True
-            continue
-        if "EOF" in line:
-            break
-        if coord_section:
-            parts = line.strip().split()
-            if len(parts) >= 3:
-                node_id = int(parts[0])
-                x = float(parts[1])
-                y = float(parts[2])
-                nodes[node_id] = (x, y)
-    return nodes
-
-def solve_tsp_ortools(nodes, instance_name):
-    """
-    Solves TSP using OR-Tools with Guided Local Search.
-    Saves solution with GAP and STATUS fields.
-    """
-    # 1. Create Distance Matrix
-    node_ids = list(nodes.keys())
-    size = len(node_ids)
-    dist_matrix = {}
+    # 3. Solve with OR-Tools
+    solve_tsp_ortools(nodes, name, base_path)
     
-    for from_node in node_ids:
-        dist_matrix[from_node] = {}
-        for to_node in node_ids:
-            if from_node == to_node:
-                dist_matrix[from_node][to_node] = 0
-            else:
-                x1, y1 = nodes[from_node]
-                x2, y2 = nodes[to_node]
-                dist = int(math.sqrt((x1 - x2)**2 + (y1 - y2)**2))
-                dist_matrix[from_node][to_node] = dist
+    return curr_nodes
 
-    # 2. Setup Routing Model
+def solve_tsp_ortools(nodes, instance_name, base_path):
+    """Solves the instance and saves the tour."""
+    node_ids = [n[0] for n in nodes]
+    coords = {n[0]: (n[1], n[2]) for n in nodes}
+    size = len(node_ids)
+    
+    dist_matrix = {}
+    for i in node_ids:
+        dist_matrix[i] = {}
+        for j in node_ids:
+            if i == j: dist_matrix[i][j] = 0
+            else:
+                x1, y1 = coords[i]
+                x2, y2 = coords[j]
+                dist_matrix[i][j] = int(math.sqrt((x1-x2)**2 + (y1-y2)**2))
+
     manager = pywrapcp.RoutingIndexManager(size, 1, 0) 
     routing = pywrapcp.RoutingModel(manager)
 
@@ -97,18 +86,15 @@ def solve_tsp_ortools(nodes, instance_name):
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-    # 3. Search Parameters (Optimized for Quality)
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = (
         routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
     search_parameters.local_search_metaheuristic = (
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
-    search_parameters.time_limit.seconds = 2 # Increase for better optimality on >100 nodes
+    search_parameters.time_limit.seconds = 1 
 
-    # 4. Solve
     solution = routing.SolveWithParameters(search_parameters)
 
-    # 5. Process Result
     if solution:
         tour = []
         index = routing.Start(0)
@@ -117,105 +103,105 @@ def solve_tsp_ortools(nodes, instance_name):
             tour.append(node_ids[node_idx])
             index = solution.Value(routing.NextVar(index))
         
-        # Determine Status/Gap
-        # Note: Routing library doesn't give Proven Gap easily. 
-        # We assume 0.0 gap for our ground truth, but mark status.
-        status_id = routing.status()
-        status_map = {
-            0: "ROUTING_NOT_SOLVED",
-            1: "ROUTING_SUCCESS", # Found a solution (usually hit time limit)
-            2: "ROUTING_FAIL",
-            3: "ROUTING_FAIL_TIMEOUT",
-            4: "ROUTING_INVALID"
-        }
-        status_str = status_map.get(status_id, "UNKNOWN")
-        
-        # Save Solution File
-        sol_filename = os.path.join(SOLUTION_FOLDER, f"{instance_name}_sol.txt")
+        sol_filename = os.path.join(base_path, "solutions", f"{instance_name}_sol.txt")
         with open(sol_filename, "w") as f:
-            f.write(f"NAME : {instance_name}_sol.txt\n")
-            f.write(f"COMMENT : OR-Tools Guided Local Search\n")
-            f.write(f"TYPE : TOUR\n")
-            f.write(f"DIMENSION : {size}\n")
-            f.write(f"COST : {solution.ObjectiveValue()}\n")
-            f.write(f"STATUS : {status_str}\n")
-            # Since we treat this as Ground Truth for the RL agent:
-            f.write(f"GAP : 0.00% (Reference Solution)\n") 
+            f.write(f"COST: {solution.ObjectiveValue()}\n")
             f.write("TOUR_SECTION\n")
             for node in tour:
                 f.write(f"{node}\n")
-            f.write("-1\n")
+
+def generate_dataset_parallel(num_instances, base_path, desc):
+    ensure_dirs()
+    print(f"--- Generating {desc} Set ({num_instances} instances) ---")
+    
+    # Prepare arguments for each worker
+    # We pass min/max nodes explicitly to avoid global variable issues in workers
+    tasks = [(i, base_path, MIN_NODES, MAX_NODES) for i in range(num_instances)]
+    
+    generated_sizes = []
+    
+    # Determine CPUs (Colab usually has 2, sometimes 4)
+    num_cpus = cpu_count()
+    print(f"Using {num_cpus} CPU cores for parallel generation.")
+
+    with Pool(processes=num_cpus) as pool:
+        # imap_unordered is faster as it yields results as soon as they finish
+        for size in tqdm(pool.imap_unordered(generate_and_solve, tasks), total=num_instances):
+            generated_sizes.append(size)
             
-        return tour
-    else:
-        print(f"No solution found for {instance_name}")
-        return None
+    return generated_sizes
 
-def visualize_solution(nodes, tour, title="TSP Solution"):
+def plot_distribution():
     """
-    Visualizes the TSP solution using NetworkX.
-    Green Node = Start/End.
+    Scans the data directories to infer instance sizes from filenames
+    and plots the distribution.
     """
-    G = nx.DiGraph()
-    pos = {}
+    print("Scanning directories to generate distribution histogram...")
     
-    # Add nodes
-    for node_id, (x, y) in nodes.items():
-        G.add_node(node_id)
-        pos[node_id] = (x, y)
+    paths = {
+        "Train": TRAIN_PATH + "/instances",
+        "Val": VAL_PATH + "/instances"
+    }
     
-    # Add edges
-    edges = []
-    for i in range(len(tour)):
-        u = tour[i]
-        v = tour[(i + 1) % len(tour)] 
-        edges.append((u, v))
-    G.add_edges_from(edges)
-    
-    plt.figure(figsize=(10, 8))
-    
-    # Draw Nodes
-    nx.draw_networkx_nodes(G, pos, node_size=100, node_color='skyblue')
-    # Highlight Start Node (first in tour)
-    nx.draw_networkx_nodes(G, pos, nodelist=[tour[0]], node_size=150, node_color='green')
-    
-    # Draw Edges
-    nx.draw_networkx_edges(G, pos, edge_color='black', width=1.5, arrowstyle='-|>', arrowsize=15)
-    
-    # Draw Labels (optional, can be cluttered for 100 nodes)
-    # nx.draw_networkx_labels(G, pos, font_size=8)
-    
-    plt.title(title)
-    plt.axis('on') # Show axis for coordinates
-    plt.grid(True)
-    plt.show()
+    sizes = {"Train": [], "Val": []}
 
-# --- Main Execution ---
+    for key, path in paths.items():
+        if not os.path.exists(path):
+            print(f"Warning: Path {path} does not exist.")
+            continue
+            
+        # Filename format: tsp_{num_nodes}_{idx}.txt
+        # Example: tsp_25_100.txt -> splits to ['tsp', '25', '100.txt']
+        files = [f for f in os.listdir(path) if f.endswith(".txt")]
+        for f in files:
+            try:
+                parts = f.split('_')
+                if len(parts) >= 2:
+                    node_count = int(parts[1])
+                    sizes[key].append(node_count)
+            except ValueError:
+                continue # Skip files that don't match pattern
+
+    # Plotting
+    plt.figure(figsize=(12, 5))
+    
+    # Define common bins for consistent x-axis
+    all_sizes = sizes["Train"] + sizes["Val"]
+    if not all_sizes:
+        print("No data found to plot.")
+        return
+        
+    min_bin = min(all_sizes)
+    max_bin = max(all_sizes)
+    bins = range(min_bin, max_bin + 2)
+
+    # Train Plot
+    plt.subplot(1, 2, 1)
+    plt.hist(sizes["Train"], bins=bins, color='skyblue', edgecolor='black', alpha=0.7)
+    plt.title(f"Training Set (N={len(sizes['Train'])})")
+    plt.xlabel("Number of Nodes")
+    plt.ylabel("Count")
+
+    # Val Plot
+    plt.subplot(1, 2, 2)
+    plt.hist(sizes["Val"], bins=bins, color='salmon', edgecolor='black', alpha=0.7)
+    plt.title(f"Validation Set (N={len(sizes['Val'])})")
+    plt.xlabel("Number of Nodes")
+
+    plt.tight_layout()
+    plt.savefig("../data/data_distribution.png")
+    print(f"Histogram saved to 'data_distribution.png'")
+
+
+
 if __name__ == "__main__":
-    print(f"--- Generating {NUM_INSTANCES} Instances ---")
+    # Validate
+    # val_sizes = generate_dataset_parallel(NUM_VAL, VAL_PATH, "Validation")
     
-    # 1. Generate
-    for i in range(1, NUM_INSTANCES + 1):
-        n_nodes = random.randint(MIN_NODES, MAX_NODES)
-        generate_tsp_instance(n_nodes, i)
-        if i % 50 == 0: print(f"Generated {i}/{NUM_INSTANCES}...")
-
-    print("\n--- Solving Instances with OR-Tools ---")
-
-    # 2. Solve
-    for i in tqdm(range(1, NUM_INSTANCES + 1), desc="Solving TSP", unit="inst"):
-        instance_name = f"tsp_{i}"
-        instance_path = os.path.join(INSTANCE_FOLDER, f"{instance_name}.txt")
-        
-        nodes = parse_tsp_instance(instance_path)
-        tour = solve_tsp_ortools(nodes, instance_name)
-        
-        # Visualize the first instance only
-        # Note: plt.show() blocks execution, so the progress bar will pause 
-        # until you close the window.
-        if i == 1:
-            # We use tqdm.write to print above the progress bar without breaking it
-            tqdm.write(f"Visualizing solution for {instance_name}...")
-            visualize_solution(nodes, tour, title=f"Solution: {instance_name}")
-
-    print(f"\nDone! Solutions saved in '{SOLUTION_FOLDER}'.")
+    # Train
+    # train_sizes = generate_dataset_parallel(NUM_TRAIN, TRAIN_PATH, "Training")
+    
+    # Plot
+    plot_distribution()
+    
+    print("\nData Generation Complete!")
